@@ -1,0 +1,456 @@
+# -- coding: utf-8 --
+import time
+import cv2
+import numpy as np
+import threading
+import RPi.GPIO as GPIO
+from picamera2 import Picamera2
+from tflite_runtime.interpreter import Interpreter
+
+# ===================== 1. HARDWARE AND MOTOR SETUP =====================
+GPIO.setmode(GPIO.BOARD)
+GPIO.setwarnings(False)
+
+# Motor pins
+ENA, IN1, IN2 = 15, 11, 13
+ENB, IN3, IN4 = 22, 18, 16
+
+GPIO.setup([ENA, ENB, IN1, IN2, IN3, IN4], GPIO.OUT)
+
+pwmL = GPIO.PWM(ENA, 500)
+pwmR = GPIO.PWM(ENB, 500)
+pwmL.start(0)
+pwmR.start(0)
+
+def set_motor_speed(left, right):
+    left = max(min(left, 100), -100)
+    right = max(min(right, 100), -100)
+
+    if left >= 0:
+        GPIO.output(IN1, GPIO.HIGH)
+        GPIO.output(IN2, GPIO.LOW)
+    else:
+        GPIO.output(IN1, GPIO.LOW)
+        GPIO.output(IN2, GPIO.HIGH)
+    pwmL.ChangeDutyCycle(abs(left))
+
+    if right >= 0:
+        GPIO.output(IN3, GPIO.HIGH)
+        GPIO.output(IN4, GPIO.LOW)
+    else:
+        GPIO.output(IN3, GPIO.LOW)
+        GPIO.output(IN4, GPIO.HIGH)
+    pwmR.ChangeDutyCycle(abs(right))
+
+def coast_stop():
+    set_motor_speed(0, 0)
+
+# ===================== 2. SHARED STATE (AI & VISION) =====================
+class SharedState:
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.frame = None
+        self.detected_symbol = "BACKGROUND"
+        self.confidence = 0.0
+        self.is_running = True
+        self.scan_speed_active = False
+
+shared_state = SharedState()
+
+# ===================== 3. AI THREAD =====================
+def load_labels(filename):
+    with open(filename, 'r') as f:
+        return [line.strip().split(' ', 1)[1] for line in f.readlines()]
+
+def ai_worker():
+    print("[AI Thread] Loading Model...")
+    try:
+        interpreter = Interpreter(model_path="/home/nicolekyra/zip test/model_unquant.tflite")
+        interpreter.allocate_tensors()
+        input_details = interpreter.get_input_details()
+        output_details = interpreter.get_output_details()
+        labels = load_labels("labels.txt")
+    except Exception as e:
+        print("[AI Thread] ERROR: " + str(e))
+        return
+
+    while shared_state.is_running:
+        with shared_state.lock:
+            frame = shared_state.frame.copy() if shared_state.frame is not None else None
+
+        if frame is not None:
+            img = cv2.resize(frame, (224, 224))
+            img = (np.float32(img) / 127.5) - 1.0
+            input_data = np.expand_dims(img, axis=0)
+
+            interpreter.set_tensor(input_details[0]['index'], input_data)
+            interpreter.invoke()
+            output_data = interpreter.get_tensor(output_details[0]['index'])[0]
+
+            best_idx = np.argmax(output_data)
+            detected = labels[best_idx].upper()
+            confidence = output_data[best_idx]
+            
+            with shared_state.lock:
+                shared_state.detected_symbol = detected
+                shared_state.confidence = confidence
+                
+                # Slower scan speed activates if ANY arrow class is detected
+                if "ARROW" in detected and confidence > 0.80:
+                    shared_state.scan_speed_active = True
+                    print(f"[AI] {detected} detected! Activating scan speed mode (confidence: {confidence:.2f})")
+
+        time.sleep(0.05)
+
+# ===================== 4. ACTION FUNCTIONS =====================
+def execute_forward_burst():
+    print("[Forward] Pushing forward past junction")
+    # Drive straight at a steady speed to clear the intersection
+    set_motor_speed(50, 50) 
+    time.sleep(0.5) 
+    coast_stop()
+    time.sleep(0.1)
+
+def execute_90_degree_turn(direction):
+    print(f"[Turn] Executing 90-degree {direction} turn")
+    coast_stop()
+    time.sleep(0.1)
+    
+    turn_speed = 75
+    if direction == "LEFT":
+        set_motor_speed(-turn_speed, turn_speed)
+    else:
+        set_motor_speed(turn_speed, -turn_speed)
+    
+    time.sleep(0.5)
+    
+    slow_speed = 40
+    if direction == "LEFT":
+        set_motor_speed(-slow_speed, slow_speed)
+    else:
+        set_motor_speed(slow_speed, -slow_speed)
+    
+    start_time = time.time()
+    line_found = False
+    
+    while time.time() - start_time < 1.0:
+        frame = picam2.capture_array()
+        h, w, _ = frame.shape
+        roi_line = frame[h-80:h, :]
+        gray_line = cv2.cvtColor(roi_line, cv2.COLOR_RGB2GRAY)
+        _, bin_line = cv2.threshold(gray_line, THRESH_LINE, 255, cv2.THRESH_BINARY_INV)
+        contours, _ = cv2.findContours(bin_line, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        
+        if contours:
+            c = max(contours, key=cv2.contourArea)
+            if cv2.contourArea(c) > 500:
+                line_found = True
+                print("[Turn] Line detected!")
+                break
+        
+        time.sleep(0.02)
+    
+    coast_stop()
+    time.sleep(0.1)
+    
+    if not line_found:
+        print("[Turn] Warning: Line not found after turn")
+    
+    return line_found
+
+def execute_360_spin():
+    print("[Spin] Starting 360-degree spin")
+    coast_stop()
+    time.sleep(0.1)
+    
+    spin_speed = 80
+    print("[Spin] Segment 1: 180 degrees")
+    set_motor_speed(spin_speed, -spin_speed)
+    time.sleep(1.1)
+    
+    coast_stop()
+    time.sleep(0.2)
+    
+    print("[Spin] Segment 2: Another 180 degrees")
+    set_motor_speed(spin_speed, -spin_speed)
+    time.sleep(1.1)
+    
+    coast_stop()
+    time.sleep(0.2)
+    
+    print("[Spin] Fine-tuning to find line...")
+    set_motor_speed(45, -45)
+    
+    start_time = time.time()
+    line_found = False
+    
+    while time.time() - start_time < 1.5:
+        frame = picam2.capture_array()
+        h, w, _ = frame.shape
+        roi_line = frame[h-80:h, :]
+        gray_line = cv2.cvtColor(roi_line, cv2.COLOR_RGB2GRAY)
+        _, bin_line = cv2.threshold(gray_line, THRESH_LINE, 255, cv2.THRESH_BINARY_INV)
+        contours, _ = cv2.findContours(bin_line, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        
+        if contours:
+            c = max(contours, key=cv2.contourArea)
+            if cv2.contourArea(c) > 500:
+                line_found = True
+                print("[Spin] Line found - spin complete!")
+                break
+        
+        time.sleep(0.02)
+    
+    coast_stop()
+    time.sleep(0.1)
+    
+    if not line_found:
+        print("[Spin] Warning: Could not find line after spin")
+    
+    return line_found
+
+# ===================== 5. CONFIGURATION & CAMERA SETUP =====================
+picam2 = Picamera2()
+picam2.preview_configuration.main.size = (640, 480)
+picam2.preview_configuration.main.format = "RGB888"
+picam2.configure("preview")
+picam2.start()
+
+ai_thread = threading.Thread(target=ai_worker, daemon=True)
+ai_thread.start()
+
+# --- Speed & System Config ---
+NORMAL_SPEED = 29    # Scaled up for PI control
+SCAN_SPEED = 25      # Slow down when AI sees an arrow
+MAX_SPEED = 90
+KP = 0.5
+KI = 0.02
+THRESH_LINE = 60
+COOLDOWN_TIME = 4.0
+SCAN_SPEED_DURATION = 2.0
+
+# --- Yellow Line Configuration ---
+lower_yellow = np.array([90, 150, 210])
+upper_yellow = np.array([110, 255, 240])
+
+# --- Red Line Configuration (from provided data) ---
+# Taking the minimum and maximum ranges from the provided arrays:
+# [115, 10, 195] to [126, 158, 246] -> padded max to 255
+lower_red = np.array([115, 10, 195])
+upper_red = np.array([126, 160, 255])
+
+MIN_COLOR_PIXELS_START = 400
+MIN_COLOR_PIXELS_KEEP = 200
+
+# Start looking for standard line first
+active_target_color = "BLACK"
+
+state = 'LINE_FOLLOW'
+integral = 0
+last_time = time.time()
+last_error = 0
+last_action_time = 0
+scan_speed_timer = 0
+current_speed = NORMAL_SPEED
+
+print("System initialised. Entering main loop...")
+print("COMBINED MODE: Multi-Color Line Priority + AI Symbol Detection Active")
+
+# ===================== 6. MAIN LOOP =====================
+try:
+    while True:
+        frame = picam2.capture_array()
+        h, w, _ = frame.shape
+        disp = frame.copy()
+        current_time = time.time()
+        dt = current_time - last_time
+        last_time = current_time
+
+        # Update Shared State for AI Thread
+        with shared_state.lock:
+            shared_state.frame = frame.copy()
+            ai_label = shared_state.detected_symbol
+            ai_conf = shared_state.confidence
+            scan_speed_flag = shared_state.scan_speed_active
+
+        # --- SCAN SPEED MANAGEMENT ---
+        if "ARROW" in ai_label and ai_conf > 0.80:
+            scan_speed_timer = SCAN_SPEED_DURATION
+            current_speed = SCAN_SPEED
+        elif scan_speed_timer > 0:
+            scan_speed_timer -= dt
+            if scan_speed_timer <= 0:
+                current_speed = NORMAL_SPEED
+                with shared_state.lock:
+                    shared_state.scan_speed_active = False
+            else:
+                current_speed = SCAN_SPEED
+        else:
+            current_speed = NORMAL_SPEED
+            with shared_state.lock:
+                if shared_state.scan_speed_active:
+                    shared_state.scan_speed_active = False
+
+        # --- STATE MACHINE ---
+        if state == 'LINE_FOLLOW':
+            # Crop to Region of Interest (Bottom 240 pixels for peripheral vision)
+            roi = frame[h-240:h, :]
+            
+            # Convert ROI to HSV for color masking
+            hsv = cv2.cvtColor(roi, cv2.COLOR_RGB2HSV)
+            
+            # Create masks for colored lines
+            mask_yellow = cv2.inRange(hsv, lower_yellow, upper_yellow)
+            mask_red = cv2.inRange(hsv, lower_red, upper_red)
+            
+            yellow_px = cv2.countNonZero(mask_yellow)
+            red_px = cv2.countNonZero(mask_red)
+            
+            # --- STICKY PRIORITY LOGIC ---
+            # Release lock if the active color disappears
+            if active_target_color == "YELLOW" and yellow_px < MIN_COLOR_PIXELS_KEEP:
+                active_target_color = "BLACK"
+            elif active_target_color == "RED" and red_px < MIN_COLOR_PIXELS_KEEP:
+                active_target_color = "BLACK" 
+                    
+            # If tracking black (default), look for colored lines to prioritize
+            if active_target_color == "BLACK":
+                # Check for Red first (Priority over yellow if both exist at a junction)
+                if red_px > MIN_COLOR_PIXELS_START:
+                    active_target_color = "RED"
+                    print("Red Line detected! Tracking RED.")
+                elif yellow_px > MIN_COLOR_PIXELS_START:
+                    active_target_color = "YELLOW"
+                    print("Yellow Line detected! Tracking YELLOW.")
+
+            # Apply the chosen mask based on the locked state
+            if active_target_color == "YELLOW":
+                target_mask = mask_yellow
+                target_color_name = "YELLOW"
+            elif active_target_color == "RED":
+                target_mask = mask_red
+                target_color_name = "RED"
+            else:
+                gray = cv2.cvtColor(roi, cv2.COLOR_RGB2GRAY)
+                blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+                _, target_mask = cv2.threshold(blurred, THRESH_LINE, 255, cv2.THRESH_BINARY_INV)
+                target_color_name = "BLACK"
+            
+            # FIND CONTOURS & STEER
+            contours, _ = cv2.findContours(target_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            
+            if contours:
+                largest_contour = max(contours, key=cv2.contourArea)
+                M = cv2.moments(largest_contour)
+                
+                if M['m00'] > 150: 
+                    cx = int(M['m10'] / M['m00'])
+                    error = cx - (w // 2)
+                    
+                    integral += error * dt
+                    integral = max(min(integral, 500), -500) # Anti-Windup
+                    
+                    correction = int((error * KP) + (integral * KI))
+                    
+                    # Steer using the dynamically adjusted current_speed
+                    left_speed = current_speed + correction
+                    right_speed = current_speed - correction
+                    
+                    # Constrain speeds
+                    left_speed = max(min(left_speed, MAX_SPEED), -MAX_SPEED)
+                    right_speed = max(min(right_speed, MAX_SPEED), -MAX_SPEED)
+                    
+                    set_motor_speed(left_speed, right_speed)
+                    last_error = error
+
+                    # Visual Debugging 
+                    if target_color_name == "YELLOW":
+                        dot_color = (0, 255, 255)
+                    elif target_color_name == "RED":
+                        dot_color = (0, 0, 255)
+                    else:
+                        dot_color = (0, 255, 0)
+                        
+                    cv2.drawContours(disp[h-240:h, :], [largest_contour], -1, dot_color, 2)
+                    cv2.circle(disp, (cx, h - 120), 5, dot_color, -1)
+            else:
+                # Line Lost Recovery
+                integral = 0
+                if 'last_error' in locals() and last_error > 0:
+                    set_motor_speed(80, -80)
+                else:
+                    set_motor_speed(-80, 80)
+
+            # --- AI ACTION TRIGGERS ---
+            trigger_threshold = 0.75 if scan_speed_timer > 0 else 0.85
+            
+            if ai_conf > trigger_threshold and (current_time - last_action_time > COOLDOWN_TIME):
+                if "STOP" in ai_label:
+                    state = 'ACTION_STOP'
+                elif "RECYCLE" in ai_label:
+                    state = 'ACTION_RECYCLE'
+                elif "LEFT_ARROW" in ai_label:
+                    print(f"[Arrow] Left Arrow detected ({ai_conf:.2f}). Forcing LEFT turn.")
+                    state = 'ACTION_LEFT'
+                elif "UP_ARROW" in ai_label:
+                    print(f"[Arrow] Up Arrow detected ({ai_conf:.2f}). Forcing FORWARD.")
+                    state = 'ACTION_FORWARD'
+
+        # --- AI ACTION STATES ---
+        elif state == 'ACTION_STOP':
+            print("[Action] STOP - pausing 3 seconds")
+            coast_stop()
+            time.sleep(3.0)
+            last_action_time = time.time()
+            state = 'LINE_FOLLOW'
+
+        elif state == 'ACTION_RECYCLE':
+            print("[Action] RECYCLE - Performing 360-degree spin")
+            execute_360_spin()
+            last_action_time = time.time()
+            state = 'LINE_FOLLOW'
+
+        elif state == 'ACTION_LEFT':
+            execute_90_degree_turn("LEFT")
+            last_action_time = time.time()
+            state = 'LINE_FOLLOW'
+            
+        elif state == 'ACTION_FORWARD':
+            execute_forward_burst()
+            last_action_time = time.time()
+            state = 'LINE_FOLLOW'
+
+        # --- DISPLAY OVERLAY ---
+        if scan_speed_timer > 0:
+            cv2.putText(disp, f"SCAN SPEED MODE: {current_speed}% ({scan_speed_timer:.1f}s)", 
+                       (20, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+        else:
+            cv2.putText(disp, f"Normal Speed: {current_speed}%", 
+                       (20, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+        
+        cv2.putText(disp, f"Tracking: {active_target_color}", (20, 100), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 100, 255), 2)
+        overlay_text = f"AI: {ai_label} ({round(ai_conf * 100)}%) | State: {state}"
+        cv2.putText(disp, overlay_text, (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 0), 2)
+        
+        cv2.imshow("Robot Eye", disp)
+        if state == 'LINE_FOLLOW':
+            cv2.imshow("Active Mask", target_mask)
+
+        # Keyboard controls
+        key = cv2.waitKey(1) & 0xFF
+        if key == ord('q'):
+            break
+        elif key == ord('+') or key == ord('='):
+            SCAN_SPEED = min(SCAN_SPEED + 2, 80)
+            print(f"[Manual] Scan speed increased to {SCAN_SPEED}%")
+        elif key == ord('-') or key == ord('_'):
+            SCAN_SPEED = max(SCAN_SPEED - 2, 5)
+            print(f"[Manual] Scan speed decreased to {SCAN_SPEED}%")
+
+finally:
+    shared_state.is_running = False
+    coast_stop()
+    GPIO.cleanup()
+    picam2.stop()
+    cv2.destroyAllWindows()
+    print("System shutdown.")
