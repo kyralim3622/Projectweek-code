@@ -1,0 +1,176 @@
+import RPi.GPIO as GPIO
+import smbus
+import time
+
+# --- 1. SETUP: GPIO PINS ---
+GPIO.setmode(GPIO.BOARD)
+GPIO.setwarnings(False)
+
+# Left Motor Pins
+IN1 = 18; IN2 = 16; ENA = 22
+# Right Motor Pins
+IN3 = 11; IN4 = 13; ENB = 15
+
+GPIO.setup([IN1, IN2, ENA, IN3, IN4, ENB], GPIO.OUT)
+
+# PWM (Speed Control)
+pwm_left = GPIO.PWM(ENA, 100) #frequency
+pwm_right = GPIO.PWM(ENB, 100) #frequency
+pwm_left.start(0) #duty cycle
+pwm_right.start(0) #duty cycle
+
+# SPEEDS
+MOVE_SPEED = 100    # Speed for Forward/Gostan (duty cycle)
+TURN_SPEED = 75     # Slightly slower for better stopping accuracy (duty cycle)
+
+# --- 2. SETUP: MPU6050 (GYRO) ---
+PWR_MGMT_1 = 0x6B
+GYRO_ZOUT_H = 0x47
+bus = smbus.SMBus(1)
+Device_Address = 0x68
+
+try:
+    bus.write_byte_data(Device_Address, PWR_MGMT_1, 0)
+except Exception as e:
+    print(f"Error: I2C not connected. {e}")
+
+def read_raw_data(addr):
+    high = bus.read_byte_data(Device_Address, addr)
+    low = bus.read_byte_data(Device_Address, addr+1)
+    value = ((high << 8) | low)
+    if(value > 32768):
+        value = value - 65536 #full raw data(65536)/full scale range(500)=131(sensitivity scale factor)
+    return value
+
+# --- 3. CALIBRATION ---
+print("--- CALIBRATING GYRO ---")
+print("KEEP ROBOT STILL...")
+gyro_z_offset = 0
+for i in range(100): #takes 100 readings
+    gyro_z_offset += read_raw_data(GYRO_ZOUT_H) #adds all 100 readings together
+    time.sleep(0.01)
+gyro_z_offset = gyro_z_offset / 100 #divides by 100 to find the average error.
+print(f"Done. Offset: {gyro_z_offset:.2f}")
+
+# --- 4. MOVEMENT FUNCTIONS ---
+
+def stop():
+    """ Standard Stop (Coast) """
+    GPIO.output(IN1, GPIO.LOW); GPIO.output(IN2, GPIO.LOW)
+    GPIO.output(IN3, GPIO.LOW); GPIO.output(IN4, GPIO.LOW)
+    pwm_left.ChangeDutyCycle(0)
+    pwm_right.ChangeDutyCycle(0)
+
+def hard_stop():
+    """ 
+    Active Braking: Briefly reverses motors to kill momentum 
+    This prevents the 'drifting forward' issue.
+    """
+    print("DEBUG: Hard Stop Triggered")
+    # Quickly reverse all pins to lock wheels
+    # We just set all LOW first to be safe
+    GPIO.output(IN1, GPIO.LOW); GPIO.output(IN2, GPIO.LOW)
+    GPIO.output(IN3, GPIO.LOW); GPIO.output(IN4, GPIO.LOW)
+    time.sleep(0.1) 
+    stop()
+
+def forward():
+    print("State: Moving Forward")
+    GPIO.output(IN1, GPIO.HIGH); GPIO.output(IN2, GPIO.LOW) 
+    GPIO.output(IN3, GPIO.HIGH); GPIO.output(IN4, GPIO.LOW)
+    pwm_left.ChangeDutyCycle(MOVE_SPEED)
+    pwm_right.ChangeDutyCycle(MOVE_SPEED)
+    time.sleep(1.0)
+    stop()
+
+def gostan():
+    print("State: Moving Gostan")
+    GPIO.output(IN1, GPIO.LOW); GPIO.output(IN2, GPIO.HIGH)
+    GPIO.output(IN3, GPIO.LOW); GPIO.output(IN4, GPIO.HIGH)
+    pwm_left.ChangeDutyCycle(MOVE_SPEED)
+    pwm_right.ChangeDutyCycle(MOVE_SPEED)
+    time.sleep(1.0)
+    stop()
+
+def turn_precise(target_angle, direction):
+    print(f"--- Turning {direction.upper()} {target_angle} degrees ---")
+    
+    # 1. Set Motor Direction
+    if direction == "right":
+        # Right Turn: Left Fwd, Right Back
+        GPIO.output(IN1, GPIO.HIGH); GPIO.output(IN2, GPIO.LOW)
+        GPIO.output(IN3, GPIO.LOW); GPIO.output(IN4, GPIO.HIGH)
+    elif direction == "left":
+        # Left Turn: Left Back, Right Fwd
+        GPIO.output(IN1, GPIO.LOW); GPIO.output(IN2, GPIO.HIGH)
+        GPIO.output(IN3, GPIO.HIGH); GPIO.output(IN4, GPIO.LOW)
+        
+    pwm_left.ChangeDutyCycle(TURN_SPEED)
+    pwm_right.ChangeDutyCycle(TURN_SPEED)
+    
+    # 2. Track Angle
+    current_angle = 0
+    last_time = time.time()
+    
+    while current_angle < target_angle:
+        now = time.time()
+        dt = now - last_time
+        last_time = now
+        
+        # Read Gyro
+        raw_z = read_raw_data(GYRO_ZOUT_H)
+        corrected_z = raw_z - gyro_z_offset
+        rate = corrected_z / 131.0
+        
+        # Integrate
+        current_angle += abs(rate * dt)
+        
+        time.sleep(0.005)
+        
+    # 3. CRITICAL FIX: HARD STOP
+    print(f"Angle Reached: {current_angle:.1f}. Stopping.")
+    hard_stop() # Use Hard Stop instead of normal stop
+    time.sleep(0.5) # Wait for momentum to die down completely
+
+# --- 5. MAIN CONTROL LOOP ---
+print("\n--- ROBOT READY ---")
+print("Commands: f (Front), g (Gostan), l (Left+Angle), r (Right+Angle)")
+
+try:
+    while True:
+        cmd = input("\nEnter Command: ").lower().strip()
+        
+        if cmd == 'f':
+            forward()
+            
+        elif cmd == 'g':
+            gostan()
+            
+        elif cmd == 'r':
+            try:
+                angle = float(input("Enter Angle for RIGHT: "))
+                turn_precise(angle, "left")
+                # DEBUG: Ensure no other command runs here
+                print("DEBUG: Left Turn Logic Finished.")
+            except ValueError:
+                print("Error: Enter a number")
+
+        elif cmd == 'l':
+            try:
+                angle = float(input("Enter Angle for LEFT: "))
+                turn_precise(angle, "right")
+                # DEBUG: Ensure no other command runs here
+                print("DEBUG: Right Turn Logic Finished.")
+            except ValueError:
+                print("Error: Enter a number")
+                
+        elif cmd == 'q':
+            break
+        else:
+            print("Invalid command.")
+
+except KeyboardInterrupt:
+    print("\nForce Quit")
+finally:
+    stop()
+    GPIO.cleanup()
