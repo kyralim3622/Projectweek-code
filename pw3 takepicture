@@ -1,0 +1,83 @@
+from picamera2 import Picamera2
+import cv2
+import os
+
+# 1. Define your NEW shape categories
+# Note: 'left', 'right', 'stop', 'recycle', 'thumbprint', 'qr'
+categories = ["left", "forward", "stop", "recycle", "thumbprint", "qr","line"]
+base_folder = "datasat"
+
+# Automatically create a folder for each shape
+for category in categories:
+    folder_path = os.path.join(base_folder, category)
+    if not os.path.exists(folder_path):
+        os.makedirs(folder_path)
+        print(f"Created folder: {folder_path}/")
+
+# Initialize counters for each category
+counters = {cat: 1 for cat in categories}
+
+# 2. Set up the camera
+picam2 = Picamera2()
+picam2.configure(picam2.create_video_configuration(main={"size": (640, 480)}))
+picam2.start()
+
+print("\n--- DATA COLLECTION MODE ACTIVE ---")
+print("Press 'l' for LEFT")
+print("Press 'f' for FORWARD")
+print("Press 's' for STOP")
+print("Press 'e' for RECYCLE") # Changed to 'e' because 'r' is taken by RIGHT
+print("Press 't' for THUMBPRINT")
+print("Press 'q' for QR CODE")
+print("Press 'n' for LINE")
+print("Press 'ESC' to QUIT\n")
+
+try:
+    while True:
+        # 3. Capture and convert for OpenCV
+        frame = picam2.capture_array()
+        frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+        
+        cv2.imshow("Datasat Collector", frame_bgr)
+
+        # 4. Keyboard Logic
+        key = cv2.waitKey(1) & 0xFF
+        category_to_save = None
+
+        if key == ord('l'):
+            category_to_save = "left"
+        elif key == ord('f'):
+            category_to_save = "forward"
+        elif key == ord('s'):
+            category_to_save = "stop"
+        elif key == ord('e'): # Used 'e' for rEcycle
+            category_to_save = "recycle"
+        elif key == ord('t'):
+            category_to_save = "thumbprint"
+        elif key == ord('q'):
+            category_to_save = "qr"
+        elif key == ord('n'):
+            category_to_save = "line"
+        
+        # Press ESC (27) to quit
+        elif key == 27:
+            print("\nShutting down...")
+            break
+
+        # 5. Save the image
+        if category_to_save:
+            count = counters[category_to_save]
+            # Create filename
+            img_name = f"{base_folder}/{category_to_save}/{category_to_save}_{count}.jpg"
+            cv2.imwrite(img_name, frame_bgr)
+            
+            print(f" [SAVED] {img_name}")
+            counters[category_to_save] += 1 
+
+except Exception as e:
+    print(f"Error: {e}")
+
+finally:
+    picam2.stop()
+    picam2.close()
+    cv2.destroyAllWindows()
